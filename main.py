@@ -1,36 +1,32 @@
 
 import key_param
 
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage
-
-from pymongo import MongoClient
-from langchain_core.tools import tool
-from langchain_ollama import OllamaEmbeddings
-
-
 from typing import Annotated
 from typing_extensions import TypedDict
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from pymongo import MongoClient
 
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     ToolMessage,
 )
 
-from langchain_core.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-)
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
-from langchain_ollama import ChatOllama
 
-# 1. Connect to MongoDB Atlas
+# ============================================================
+# 1. MONGODB CONNECTION
+# ============================================================
+
 def init_mongodb():
+    """Initialize MongoDB Atlas and retrieve collections."""
+
     client = MongoClient(
         key_param.mongodb_uri,
         serverSelectionTimeoutMS=5000
@@ -47,26 +43,36 @@ def init_mongodb():
     )
 
 
-# 2. Initialize local embedding model
+# ============================================================
+# 2. LOCAL EMBEDDING MODEL
+# ============================================================
+
 embedding_model = OllamaEmbeddings(
     model="nomic-embed-text"
 )
 
 
 def generate_embedding(text: str) -> list[float]:
-    """Generate an embedding using Ollama."""
+    """Generate a query embedding using local Ollama."""
 
     return embedding_model.embed_query(text)
 
 
-# 3. Create our MongoDB tools
+# ============================================================
+# 3. MONGODB TOOLS
+# ============================================================
+
 def create_tools(vs_collection, full_collection):
+    """Create the two MongoDB documentation tools."""
 
     @tool
     def get_information_for_question_answering(
         user_query: str
     ) -> str:
-        """Search MongoDB documentation to answer a question."""
+        """
+        Search MongoDB documentation using vector similarity.
+        Use this tool for general technical questions about MongoDB.
+        """
 
         query_embedding = generate_embedding(user_query)
 
@@ -110,80 +116,163 @@ def create_tools(vs_collection, full_collection):
     def get_page_content_for_summarization(
         user_query: str
     ) -> str:
-        """Retrieve a complete MongoDB document by its exact title."""
+        """
+        Retrieve a complete MongoDB documentation page by exact title.
+        Use this tool when the user asks to summarize a specific page.
+        """
 
         document = full_collection.find_one(
             {"title": user_query},
-            {"_id": 0, "body": 1}
+            {"_id": 0, "title": 1, "body": 1}
         )
 
-        if document:
-            return document["body"]
+        if document is None:
+            return "Document not found."
 
-        return "Document not found."
+        return (
+            f"Title: {document['title']}\n\n"
+            f"{document.get('body', '')}"
+        )
 
     return [
         get_information_for_question_answering,
         get_page_content_for_summarization
     ]
 
-# Define the graph state
+
+# ============================================================
+# 4. GRAPH STATE
+# ============================================================
+
 class GraphState(TypedDict):
+    """Conversation messages accumulated by LangGraph."""
+
     messages: Annotated[list[BaseMessage], add_messages]
 
 
-# Agent node
-def agent(state: GraphState, llm_with_tools):
-    """Run the LLM using the current conversation."""
+# ============================================================
+# 5. AGENT NODE
+# ============================================================
 
+def agent(
+    state: GraphState,
+    llm_with_tools,
+    final_chain
+):
+    """
+    Select an appropriate tool or generate the final answer.
+    """
+
+    messages = state["messages"]
+
+    # If the previous node returned documentation,
+    # produce the final answer without enabling tools again.
+    if isinstance(messages[-1], ToolMessage):
+
+        print("\nGenerating final answer from MongoDB documents...")
+
+        question = next(
+            (
+                message.content
+                for message in reversed(messages)
+                if isinstance(message, HumanMessage)
+            ),
+            ""
+        )
+
+        # Collect the results of the most recent tool executions.
+        observations = []
+
+        for message in reversed(messages):
+            if not isinstance(message, ToolMessage):
+                break
+
+            observations.append(message.content)
+
+        observations.reverse()
+
+        missing_results = {
+            "No relevant documents found.",
+            "Document not found."
+        }
+
+        if all(
+            result.strip() in missing_results
+            or result.startswith("Unknown tool:")
+            for result in observations
+        ):
+            return {
+                "messages": [
+                    AIMessage(content="I DON'T KNOW")
+                ]
+            }
+
+        context = "\n\n".join(observations)
+
+        response = final_chain.invoke({
+            "question": question,
+            "context": context
+        })
+
+        return {"messages": [response]}
+
+    # Otherwise, let Llama decide whether a tool is needed.
     response = llm_with_tools.invoke({
-        "messages": state["messages"]
+        "messages": messages
     })
 
     return {"messages": [response]}
 
 
-# Tool execution node
+# ============================================================
+# 6. TOOL NODE
+# ============================================================
+
 def tool_node(state: GraphState, tools_by_name):
-    """Execute the tools requested by the LLM."""
+    """Execute tool calls requested by the language model."""
 
     results = []
 
     tool_calls = state["messages"][-1].tool_calls
 
     for tool_call in tool_calls:
+
         tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
 
         print(f"\nExecuting tool: {tool_name}")
+        print(f"Arguments: {tool_args}")
 
         if tool_name not in tools_by_name:
             observation = f"Unknown tool: {tool_name}"
+
         else:
             selected_tool = tools_by_name[tool_name]
 
-            observation = selected_tool.invoke(
-                tool_call["args"]
-            )
+            observation = selected_tool.invoke(tool_args)
 
         results.append(
             ToolMessage(
                 content=str(observation),
                 tool_call_id=tool_call["id"],
-                name=tool_name,
+                name=tool_name
             )
         )
 
     return {"messages": results}
 
 
-# Conditional routing
+# ============================================================
+# 7. CONDITIONAL ROUTER
+# ============================================================
+
 def route_tools(state: GraphState):
-    """Determine whether to execute tools or finish."""
+    """Route to the tool node or finish the graph."""
 
     messages = state["messages"]
 
     if not messages:
-        raise ValueError("No messages in graph state.")
+        raise ValueError("No messages found in graph state.")
 
     last_message = messages[-1]
 
@@ -193,19 +282,34 @@ def route_tools(state: GraphState):
     return END
 
 
-# Build the LangGraph workflow
-def init_graph(llm_with_tools, tools_by_name):
+# ============================================================
+# 8. BUILD THE LANGGRAPH WORKFLOW
+# ============================================================
+
+def init_graph(
+    llm_with_tools,
+    final_chain,
+    tools_by_name
+):
+    """Create and compile the agent's decision-making graph."""
 
     graph = StateGraph(GraphState)
 
     graph.add_node(
         "agent",
-        lambda state: agent(state, llm_with_tools)
+        lambda state: agent(
+            state,
+            llm_with_tools,
+            final_chain
+        )
     )
 
     graph.add_node(
         "tools",
-        lambda state: tool_node(state, tools_by_name)
+        lambda state: tool_node(
+            state,
+            tools_by_name
+        )
     )
 
     graph.add_edge(START, "agent")
@@ -215,25 +319,30 @@ def init_graph(llm_with_tools, tools_by_name):
         route_tools,
         {
             "tools": "tools",
-            END: END,
+            END: END
         }
     )
 
-    # Send tool results back to the agent
     graph.add_edge("tools", "agent")
 
     return graph.compile()
 
 
+# ============================================================
+# 9. EXECUTE AND DISPLAY THE GRAPH
+# ============================================================
+
 def execute_graph(app, user_input: str):
-    """Execute the graph and display its output."""
+    """Execute the graph and display all processing stages."""
 
     print("\n" + "=" * 60)
     print("USER:", user_input)
     print("=" * 60)
 
     input_state = {
-        "messages": [HumanMessage(content=user_input)]
+        "messages": [
+            HumanMessage(content=user_input)
+        ]
     }
 
     final_answer = None
@@ -243,26 +352,36 @@ def execute_graph(app, user_input: str):
         config={"recursion_limit": 10},
         stream_mode="updates"
     ):
+
         for node_name, value in output.items():
 
             print(f"\nNODE: {node_name}")
 
-            last_message = value["messages"][-1]
+            messages = value["messages"]
+            last_message = messages[-1]
 
             if node_name == "agent":
-                if last_message.tool_calls:
-                    print(
-                        "Requested tools:",
-                        last_message.tool_calls
-                    )
+
+                if getattr(last_message, "tool_calls", None):
+                    print("Requested tools:")
+
+                    for tool_call in last_message.tool_calls:
+                        print("Name:", tool_call["name"])
+                        print("Arguments:", tool_call["args"])
+
                 else:
                     final_answer = last_message.content
 
             elif node_name == "tools":
-                print("Tool result:")
-                print(str(last_message.content)[:1000])
 
-    print("\n--- FINAL ANSWER ---")
+                for message in messages:
+                    print("\nTool:", message.name)
+                    print("Result:")
+                    print(message.content)
+
+    print("\n" + "=" * 60)
+    print("FINAL ANSWER")
+    print("=" * 60)
 
     if final_answer is not None:
         print(final_answer)
@@ -270,16 +389,19 @@ def execute_graph(app, user_input: str):
         print("No final answer generated.")
 
 
+# ============================================================
+# 10. MAIN APPLICATION
+# ============================================================
 
 def main():
-    """Initialize and run the MongoDB AI agent."""
+    """Initialize MongoDB, Ollama and the LangGraph agent."""
 
     client, vs_collection, full_collection = init_mongodb()
 
     try:
         print("MongoDB Atlas connected successfully!")
 
-        # Initialize the MongoDB tools
+        # Create the MongoDB tools
         tools = create_tools(
             vs_collection,
             full_collection
@@ -290,36 +412,33 @@ def main():
             for tool in tools
         }
 
-        # Initialize Llama 3.2 locally
+        # Initialize the local language model
         llm = ChatOllama(
             model="llama3.2",
             temperature=0
         )
 
-        # Agent instructions
+        print("Ollama Llama 3.2 initialized successfully!")
+
+        # Prompt used when deciding which tool to call
         prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
                 """
-                You are an AI assistant specializing in MongoDB.
-
-                Use the available tools to retrieve documentation.
-
-                For general questions, use the vector search tool.
-
-                For specific documentation pages, use the
-                document retrieval tool.
-
-                Base your answers on retrieved documents.
-                Do not repeat tool calls unnecessarily.
-
-                If the retrieved information is insufficient,
-                say I DON'T KNOW.
+                You are a technical assistant specializing in MongoDB.
 
                 Available tools: {tool_names}
+
+                INSTRUCTIONS:
+                - Use the vector search tool for general
+                  questions about MongoDB documentation.
+                - Use the document retrieval tool when
+                  the user requests a specific page by title.
+                - Prefer using documentation over guessing.
+                - Do not call tools unnecessarily.
                 """
             ),
-            MessagesPlaceholder(variable_name="messages"),
+            MessagesPlaceholder(variable_name="messages")
         ])
 
         prompt = prompt.partial(
@@ -328,12 +447,46 @@ def main():
             )
         )
 
-        # Give Llama access to the tools
+        # Bind tools to Llama 3.2
         llm_with_tools = prompt | llm.bind_tools(tools)
+
+        # Separate prompt for the final answer.
+        # Tools are deliberately disabled at this stage.
+        final_prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                """
+                You are a technical assistant specializing in MongoDB.
+
+                Answer the user's question using ONLY the retrieved
+                MongoDB documentation provided below.
+
+                If the user requests a summary, summarize the
+                relevant document clearly and concisely.
+
+                Do not invent information that is not present
+                in the retrieved documentation.
+
+                Say I DON'T KNOW only if the provided documents
+                do not contain enough information to answer.
+
+                Do not request additional tools.
+                """
+            ),
+            (
+                "human",
+                "User question:\n{question}\n\n"
+                "Retrieved documentation:\n{context}\n\n"
+                "Provide your final answer:"
+            )
+        ])
+
+        final_chain = final_prompt | llm
 
         # Build the graph
         app = init_graph(
             llm_with_tools,
+            final_chain,
             tools_by_name
         )
 
@@ -355,8 +508,5 @@ def main():
         client.close()
 
 
-
 if __name__ == "__main__":
     main()
-
-
